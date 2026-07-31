@@ -1,0 +1,317 @@
+---
+# Kubernetes Deployment for DMB Agent
+# Requirements:
+#   - Kubernetes 1.16+
+#   - Secret 'dmb-agent-secrets' created
+#   - ConfigMap 'dmb-agent-config' created
+#   - PersistentVolume provisioner (optional)
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dmb-production
+  labels:
+    name: dmb-production
+
+---
+# ConfigMap for non-secret configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dmb-agent-config
+  namespace: dmb-production
+data:
+  LOG_LEVEL: "INFO"
+  DEBUG: "false"
+
+---
+# Secret for sensitive data
+# Create manually or via GitLab CI/CD:
+# kubectl create secret generic dmb-agent-secrets \
+#   --from-literal=TRADING_ECONOMICS_API_KEY=... \
+#   --from-literal=GMAIL_USERNAME=... \
+#   --from-literal=GMAIL_PASSWORD=... \
+#   --from-literal=WHATSAPP_API_TOKEN=... \
+#   --from-literal=WHATSAPP_PHONE_ID=... \
+#   --from-literal=DMB_DISPATCH_GROUPS_JSON='...' \
+#   --from-literal=DMB_HOLIDAYS_YAML='...' \
+#   -n dmb-production
+
+---
+# PersistentVolumeClaim for state
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dmb-state-pvc
+  namespace: dmb-production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# PersistentVolumeClaim for logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dmb-logs-pvc
+  namespace: dmb-production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+
+---
+# Service for external access (optional)
+apiVersion: v1
+kind: Service
+metadata:
+  name: dmb-agent-service
+  namespace: dmb-production
+  labels:
+    app: dmb-agent
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: dmb-agent
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dmb-agent
+  namespace: dmb-production
+  labels:
+    app: dmb-agent
+    version: "1.0"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: dmb-agent
+  template:
+    metadata:
+      labels:
+        app: dmb-agent
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: dmb-agent
+        image: "docker.io/aarontaii/dmb-agent:latest"  # Change to your image
+        imagePullPolicy: Always
+
+        # Startup command
+        command:
+          - /app/docker-entrypoint.sh
+        args:
+          - start
+
+        # Environment variables from Secret
+        env:
+        - name: TRADING_ECONOMICS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: TRADING_ECONOMICS_API_KEY
+
+        - name: GMAIL_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: GMAIL_USERNAME
+
+        - name: GMAIL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: GMAIL_PASSWORD
+
+        - name: WHATSAPP_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: WHATSAPP_API_TOKEN
+
+        - name: WHATSAPP_PHONE_ID
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: WHATSAPP_PHONE_ID
+
+        - name: DMB_DISPATCH_GROUPS_JSON
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: DMB_DISPATCH_GROUPS_JSON
+
+        - name: DMB_HOLIDAYS_YAML
+          valueFrom:
+            secretKeyRef:
+              name: dmb-agent-secrets
+              key: DMB_HOLIDAYS_YAML
+
+        # Environment variables from ConfigMap
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: dmb-agent-config
+              key: LOG_LEVEL
+
+        - name: DEBUG
+          valueFrom:
+            configMapKeyRef:
+              name: dmb-agent-config
+              key: DEBUG
+
+        # Resource requests and limits
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        # Liveness probe - restart if unhealthy
+        livenessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - openclaw dmb-orchestrator --status --date $(date +%Y-%m-%d) || exit 1
+          initialDelaySeconds: 60
+          periodSeconds: 300
+          timeoutSeconds: 30
+          failureThreshold: 3
+
+        # Readiness probe - ready to receive traffic
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - openclaw skills list | grep dmb-orchestrator
+          initialDelaySeconds: 30
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        # Volume mounts
+        volumeMounts:
+        - name: dmb-state
+          mountPath: /app/state
+
+        - name: dmb-logs
+          mountPath: /app/logs
+
+        # Security context for container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+              - ALL
+
+      # Volumes
+      volumes:
+      - name: dmb-state
+        persistentVolumeClaim:
+          claimName: dmb-state-pvc
+
+      - name: dmb-logs
+        persistentVolumeClaim:
+          claimName: dmb-logs-pvc
+
+      # Pod scheduling
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+
+      # Node affinity (optional - uncomment if needed)
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #       - matchExpressions:
+      #         - key: node-role.kubernetes.io/worker
+      #           operator: In
+      #           values:
+      #           - "true"
+
+---
+# HorizontalPodAutoscaler (optional - uncomment if needed)
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: dmb-agent-hpa
+#   namespace: dmb-production
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: dmb-agent
+#   minReplicas: 1
+#   maxReplicas: 3
+#   metrics:
+#   - type: Resource
+#     resource:
+#       name: cpu
+#       target:
+#         type: Utilization
+#         averageUtilization: 70
+#   - type: Resource
+#     resource:
+#       name: memory
+#       target:
+#         type: Utilization
+#         averageUtilization: 80
+
+---
+# NetworkPolicy (optional - for security)
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: dmb-agent-netpolicy
+#   namespace: dmb-production
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app: dmb-agent
+#   policyTypes:
+#   - Ingress
+#   - Egress
+#   ingress:
+#   - from:
+#     - namespaceSelector:
+#         matchLabels:
+#           name: dmb-production
+#   egress:
+#   - to:
+#     - namespaceSelector: {}
+#     ports:
+#     - protocol: TCP
+#       port: 443
+#     - protocol: TCP
+#       port: 80

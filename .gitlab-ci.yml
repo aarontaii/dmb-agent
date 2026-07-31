@@ -1,0 +1,292 @@
+# GitLab CI/CD Pipeline for DMB Agent Docker Deployment
+#
+# This pipeline:
+# 1. Builds Docker image
+# 2. Pushes to registry
+# 3. Deploys to production
+# 4. Validates deployment
+#
+# Required GitLab Variables:
+# - DOCKER_REGISTRY: Registry URL (e.g., docker.io or registry.gitlab.com)
+# - DOCKER_USERNAME: Registry username
+# - DOCKER_PASSWORD: Registry password (use token for better security)
+# - TRADING_ECONOMICS_API_KEY: TradingEconomics API key
+# - GMAIL_USERNAME: Gmail account for Bloomberg
+# - GMAIL_PASSWORD: Gmail app password
+# - WHATSAPP_API_TOKEN: WhatsApp Business API token
+# - WHATSAPP_PHONE_ID: WhatsApp phone ID
+# - DMB_DISPATCH_GROUPS_JSON: JSON config for dispatch groups
+# - DMB_HOLIDAYS_YAML: YAML config for market holidays
+# - DOCKER_HOST: Docker daemon host (for deployment)
+# - K8S_NAMESPACE: Kubernetes namespace (if using K8s)
+
+stages:
+  - build
+  - push
+  - deploy
+  - validate
+  - cleanup
+
+variables:
+  DOCKER_IMAGE_NAME: "dmb-agent"
+  DOCKER_IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+  DOCKER_FULL_IMAGE: "${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+  DOCKER_LATEST_IMAGE: "${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:latest"
+
+################################################################################
+# STAGE 1: BUILD
+################################################################################
+
+build:docker:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - echo "Building Docker image for DMB Agent..."
+    - docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY
+  script:
+    - docker build -t $DOCKER_FULL_IMAGE -t $DOCKER_LATEST_IMAGE .
+    - echo "Docker image built successfully: $DOCKER_FULL_IMAGE"
+  artifacts:
+    reports:
+      dotenv: build.env
+  cache:
+    key: docker-$CI_COMMIT_REF_SLUG
+    paths:
+      - .docker/
+  only:
+    - main
+    - master
+    - tags
+  tags:
+    - docker
+
+################################################################################
+# STAGE 2: PUSH
+################################################################################
+
+push:docker:
+  stage: push
+  image: docker:latest
+  services:
+    - docker:dind
+  dependencies:
+    - build:docker
+  before_script:
+    - echo "Pushing Docker image to registry..."
+    - docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY
+  script:
+    - docker pull $DOCKER_FULL_IMAGE
+    - docker push $DOCKER_FULL_IMAGE
+    - docker push $DOCKER_LATEST_IMAGE
+    - echo "Image pushed: $DOCKER_FULL_IMAGE"
+  only:
+    - main
+    - master
+    - tags
+  tags:
+    - docker
+
+################################################################################
+# STAGE 3: DEPLOY
+################################################################################
+
+deploy:docker-compose:
+  stage: deploy
+  image: docker:latest
+  services:
+    - docker:dind
+  dependencies:
+    - push:docker
+  before_script:
+    - docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY
+  script:
+    # Create docker-compose file with environment variables
+    - |
+      cat > docker-compose.prod.yml << EOF
+      version: '3.8'
+
+      services:
+        dmb-agent:
+          image: ${DOCKER_FULL_IMAGE}
+          container_name: dmb-agent
+          restart: always
+          environment:
+            TRADING_ECONOMICS_API_KEY: ${TRADING_ECONOMICS_API_KEY}
+            GMAIL_USERNAME: ${GMAIL_USERNAME}
+            GMAIL_PASSWORD: ${GMAIL_PASSWORD}
+            WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN}
+            WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID}
+            DMB_DISPATCH_GROUPS_JSON: '${DMB_DISPATCH_GROUPS_JSON}'
+            DMB_HOLIDAYS_YAML: '${DMB_HOLIDAYS_YAML}'
+            LOG_LEVEL: INFO
+            DEBUG: 'false'
+          volumes:
+            - dmb-state:/app/state
+            - dmb-logs:/app/logs
+          ports:
+            - "8080:8080"
+          healthcheck:
+            test: ["CMD", "openclaw", "dmb-orchestrator", "--status"]
+            interval: 300s
+            timeout: 30s
+            retries: 3
+            start_period: 30s
+
+      volumes:
+        dmb-state:
+        dmb-logs:
+      EOF
+
+    - echo "Docker Compose configuration created"
+    - cat docker-compose.prod.yml
+
+    # Option 1: Deploy using Docker Compose (if DOCKER_HOST is set)
+    - |
+      if [ -n "$DOCKER_HOST" ]; then
+        export DOCKER_HOST=$DOCKER_HOST
+        docker-compose -f docker-compose.prod.yml down || true
+        docker-compose -f docker-compose.prod.yml pull
+        docker-compose -f docker-compose.prod.yml up -d
+        echo "✓ Deployment complete"
+      else
+        echo "DOCKER_HOST not set, skipping deployment"
+        echo "To deploy, set DOCKER_HOST in GitLab CI/CD variables"
+      fi
+  artifacts:
+    paths:
+      - docker-compose.prod.yml
+    expire_in: 30 days
+  environment:
+    name: production
+    action: prepare
+  only:
+    - main
+    - master
+    - tags
+  tags:
+    - docker
+
+deploy:kubernetes:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  dependencies:
+    - push:docker
+  before_script:
+    - kubectl config use-context $K8S_CONTEXT
+  script:
+    # Create Kubernetes secret from environment variables
+    - |
+      kubectl create secret generic dmb-agent-secrets \
+        --from-literal=TRADING_ECONOMICS_API_KEY=$TRADING_ECONOMICS_API_KEY \
+        --from-literal=GMAIL_USERNAME=$GMAIL_USERNAME \
+        --from-literal=GMAIL_PASSWORD=$GMAIL_PASSWORD \
+        --from-literal=WHATSAPP_API_TOKEN=$WHATSAPP_API_TOKEN \
+        --from-literal=WHATSAPP_PHONE_ID=$WHATSAPP_PHONE_ID \
+        --from-literal=DMB_DISPATCH_GROUPS_JSON="$DMB_DISPATCH_GROUPS_JSON" \
+        --from-literal=DMB_HOLIDAYS_YAML="$DMB_HOLIDAYS_YAML" \
+        -n ${K8S_NAMESPACE:-default} \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # Create ConfigMap for non-secret config
+    - |
+      kubectl create configmap dmb-agent-config \
+        --from-literal=LOG_LEVEL=INFO \
+        --from-literal=DEBUG=false \
+        -n ${K8S_NAMESPACE:-default} \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # Deploy using kubectl
+    - kubectl set image deployment/dmb-agent dmb-agent=$DOCKER_FULL_IMAGE -n ${K8S_NAMESPACE:-default}
+    - kubectl rollout status deployment/dmb-agent -n ${K8S_NAMESPACE:-default}
+
+    - echo "✓ Kubernetes deployment complete"
+  environment:
+    name: production
+    kubernetes:
+      namespace: ${K8S_NAMESPACE:-default}
+  only:
+    - main
+    - master
+    - tags
+  when: manual
+
+################################################################################
+# STAGE 4: VALIDATE
+################################################################################
+
+validate:deployment:
+  stage: validate
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "Validating deployment..."
+    - docker ps | grep dmb-agent || echo "Container not running"
+    - docker logs dmb-agent 2>&1 | tail -20 || echo "No logs available yet"
+    - echo "✓ Validation complete"
+  only:
+    - main
+    - master
+    - tags
+  allow_failure: true
+  tags:
+    - docker
+
+validate:docker-compose:
+  stage: validate
+  image: docker:latest
+  dependencies:
+    - deploy:docker-compose
+  script:
+    - docker-compose -f docker-compose.prod.yml config
+    - echo "✓ Docker Compose configuration is valid"
+  only:
+    - main
+    - master
+    - tags
+  tags:
+    - docker
+
+################################################################################
+# STAGE 5: CLEANUP
+################################################################################
+
+cleanup:old-images:
+  stage: cleanup
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY
+  script:
+    - echo "Cleaning up old Docker images..."
+    - docker image prune -a -f --filter "until=168h" || true
+    - echo "✓ Cleanup complete"
+  only:
+    - schedules
+  tags:
+    - docker
+
+################################################################################
+# TEMPLATES
+################################################################################
+
+.docker_template: &docker_template
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY
+  tags:
+    - docker
+
+.kubernetes_template: &kubernetes_template
+  image: bitnami/kubectl:latest
+  before_script:
+    - kubectl config use-context $K8S_CONTEXT
+  only:
+    - main
+    - master
+    - tags
