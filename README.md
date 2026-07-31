@@ -1,4 +1,4 @@
-# iFAST Daily Market Brew Agent
+# Daily Market Brew Agent
 
 Automated daily market intelligence system with supervisor approval, Chinese translation, and dispatch to advisor groups across Malaysia, Singapore, and Hong Kong.
 
